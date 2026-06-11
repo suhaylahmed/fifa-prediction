@@ -54,6 +54,14 @@ REQUIRED_COLUMNS = [
     "Notes",
 ]
 
+# Optional extra key-player slots (KP3–KP6); filled only when a team has more curated players.
+OPTIONAL_KP_SLOTS = [
+    ("Key_Player_3", "KP3_Position", "KP3_Club", "KP3_Notable_Achievement"),
+    ("Key_Player_4", "KP4_Position", "KP4_Club", "KP4_Notable_Achievement"),
+    ("Key_Player_5", "KP5_Position", "KP5_Club", "KP5_Notable_Achievement"),
+    ("Key_Player_6", "KP6_Position", "KP6_Club", "KP6_Notable_Achievement"),
+]
+
 CONFEDERATION_PRIOR = {
     "UEFA": 0.68,
     "CONMEBOL": 0.66,
@@ -95,6 +103,16 @@ def _name_key(name: str) -> str:
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
     tokens = re.findall(r"[a-z0-9]+", text.lower())
     return " ".join(sorted(tokens))
+
+
+def _title_name(name: str) -> str:
+    """Convert squad-CSV ALL-CAPS names ('MBAPPE Kylian') to title case ('Mbappe Kylian')."""
+    return " ".join(w.capitalize() for w in str(name).split())
+
+
+def _clean_club(club: str) -> str:
+    """Strip the '(ENG)'-style country suffix from club names."""
+    return str(club).rsplit("(", 1)[0].strip()
 
 
 def _finish_score(value: str) -> float:
@@ -197,7 +215,14 @@ def _prepare(df: pd.DataFrame) -> pd.DataFrame:
     for col in REQUIRED_COLUMNS:
         if col not in out.columns:
             out[col] = ""
-    out = out[REQUIRED_COLUMNS].copy()
+    for slot in OPTIONAL_KP_SLOTS:
+        for col in slot:
+            if col not in out.columns:
+                out[col] = ""
+    keep = REQUIRED_COLUMNS + [c for slot in OPTIONAL_KP_SLOTS for c in slot]
+    out = out[keep].copy()
+    for col in [c for slot in OPTIONAL_KP_SLOTS for c in slot]:
+        out[col] = out[col].fillna("").astype(str).replace("nan", "")
     out["Team"] = out["Team"].map(normalize_team_name)
     out["FIFA_Ranking"] = pd.to_numeric(out["FIFA_Ranking"], errors="coerce").fillna(999).astype(int)
     out["rank_score"] = ((211 - out["FIFA_Ranking"].clip(lower=1, upper=211)) / 210).astype(float)
@@ -357,18 +382,29 @@ def get_team_profile(team: str, world_cup_2026_data: dict | None) -> dict | None
         "best_wc_finish": row.get("Team_Best_WC_Finish", ""),
         "wc_debut": str(row.get("WC_Debut", "")).strip().lower() in {"yes", "true", "1"},
         "key_players": [
-            {
-                "name": row.get("Key_Player_1", ""),
-                "position": row.get("KP1_Position", ""),
-                "club": row.get("KP1_Club", ""),
-                "achievement": row.get("KP1_Notable_Achievement", ""),
-            },
-            {
-                "name": row.get("Key_Player_2", ""),
-                "position": row.get("KP2_Position", ""),
-                "club": row.get("KP2_Club", ""),
-                "achievement": row.get("KP2_Notable_Achievement", ""),
-            },
+            p for p in [
+                {
+                    "name": row.get("Key_Player_1", ""),
+                    "position": row.get("KP1_Position", ""),
+                    "club": row.get("KP1_Club", ""),
+                    "achievement": row.get("KP1_Notable_Achievement", ""),
+                },
+                {
+                    "name": row.get("Key_Player_2", ""),
+                    "position": row.get("KP2_Position", ""),
+                    "club": row.get("KP2_Club", ""),
+                    "achievement": row.get("KP2_Notable_Achievement", ""),
+                },
+            ] + [
+                {
+                    "name": row.get(kp_col, ""),
+                    "position": row.get(pos_col, ""),
+                    "club": row.get(club_col, ""),
+                    "achievement": row.get(ach_col, ""),
+                }
+                for kp_col, pos_col, club_col, ach_col in OPTIONAL_KP_SLOTS
+            ]
+            if str(p.get("name", "")).strip()
         ],
         "notes": row.get("Notes", ""),
         "strength": float(np.clip(strength, 0.0, 1.0)),
@@ -395,6 +431,12 @@ def get_world_cup_2026_key_players(team: str, world_cup_2026_data: dict | None, 
         for p in (profile or {}).get("key_players", [])
         if str(p.get("name", "")).strip()
     }
+    # If a team has explicitly curated more than 2 players (KP3+), show only those
+    # curated players — no algorithmic fill on top. For teams with 1–2 curated
+    # players the algorithm fills the remaining spots up to `limit`.
+    # No restriction on curated players — show all of them; only fall back to `limit` when
+    # no curated players exist so the algorithm still fills a sensible number of spots.
+    effective_limit = len(curated) if curated else limit
     position_priority = {"FW": 0.08, "MF": 0.06, "GK": 0.04, "DF": 0.03}
     team_squad["curated_bonus"] = team_squad["player_name"].map(_name_key).map(
         lambda name: 0.35 if name in curated else 0.0
@@ -408,21 +450,22 @@ def get_world_cup_2026_key_players(team: str, world_cup_2026_data: dict | None, 
         + team_squad["position_bonus"]
         + team_squad["age_bonus"]
     )
+    # Sort curated players first (guaranteed appearance), then by score within each tier.
     selected = team_squad.sort_values(
-        ["key_player_score", "curated_bonus", "shirt_number"],
+        ["curated_bonus", "key_player_score", "shirt_number"],
         ascending=[False, False, True],
-    ).head(limit)
+    ).head(effective_limit)
 
     players = []
     for _, row in selected.iterrows():
         curated_info = curated.get(_name_key(row["player_name"]), {})
         players.append(
             {
-                "name": row["player_name"],
+                "name": curated_info.get("name") or _title_name(row["player_name"]),
                 "team": row["team"],
                 "shirt_number": int(row["shirt_number"]),
                 "position": row["position"],
-                "club": row["club"],
+                "club": _clean_club(row["club"]),
                 "age": int(row["age_on_2026_06_11"]),
                 "height_cm": int(row["height_cm"]),
                 "club_country_code": row["club_country_code"],
