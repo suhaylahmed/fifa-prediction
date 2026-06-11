@@ -20,6 +20,8 @@ from model.features import (
 from utils.supersub import detect_supersub
 from utils.player_stats import compute_player_features
 from data.copa_america import build_copa_feature_values
+from data.euro_2024 import build_euro_feature_values
+from data.international_friendlies import build_friendlies_feature_values
 
 # Tournament strings that count as competitive (not friendly)
 _COMPETITIVE_KEYWORDS = [
@@ -51,8 +53,11 @@ def _team_form(team: str, matches: pd.DataFrame, n: int = 10) -> dict:
     }
     if matches.empty or "tournament" not in matches.columns:
         return _zero
-    # str.contains avoids the zero-column apply() bug on empty DataFrames
-    mask = matches["tournament"].str.lower().str.contains(_COMPETITIVE_RE, na=False)
+    if "_is_competitive" in matches.columns:
+        mask = matches["_is_competitive"].fillna(False)
+    else:
+        # str.contains avoids the zero-column apply() bug on empty DataFrames
+        mask = matches["tournament"].str.lower().str.contains(_COMPETITIVE_RE, na=False)
     competitive = matches[mask]
     if competitive.empty:
         return _zero
@@ -140,11 +145,11 @@ def _h2h_features(team_a: str, team_b: str, matches: pd.DataFrame, ref_date) -> 
         if gf > ga:
             wins_a += 1
             weighted_wins_a += w
-            if _is_wc(row["tournament"]):
+            if bool(row.get("_is_wc", _is_wc(row["tournament"]))):
                 wc_wins_a += 1
         elif gf < ga:
             wins_b += 1
-            if _is_wc(row["tournament"]):
+            if bool(row.get("_is_wc", _is_wc(row["tournament"]))):
                 wc_wins_b += 1
         else:
             draws += 1
@@ -188,7 +193,7 @@ def _tournament_features(team: str, matches: pd.DataFrame, shootouts: pd.DataFra
     """
     wc = matches[
         ((matches["home_team"] == team) | (matches["away_team"] == team)) &
-        matches["tournament"].apply(_is_wc)
+        (matches["_is_wc"].fillna(False) if "_is_wc" in matches.columns else matches["tournament"].apply(_is_wc))
     ]
 
     # WC titles from known-titles dict (dataset has no stage column)
@@ -256,7 +261,7 @@ def _goalscoring_features(
     """WC avg goals and scoring-first win rate for a team."""
     wc_matches = matches[
         ((matches["home_team"] == team) | (matches["away_team"] == team)) &
-        matches["tournament"].apply(_is_wc)
+        (matches["_is_wc"].fillna(False) if "_is_wc" in matches.columns else matches["tournament"].apply(_is_wc))
     ]
     wc_goals = 0
     wc_n = len(wc_matches)
@@ -314,6 +319,9 @@ def build_feature_row(
     player_goals_df: pd.DataFrame | None = None,
     award_winners_df: pd.DataFrame | None = None,
     copa_data: dict | None = None,
+    friendlies_data: dict | None = None,
+    euro_data: dict | None = None,
+    venue_context: dict | None = None,
     skip_goalscoring: bool = False,
     skip_supersub: bool = False,
     skip_player_stats: bool = False,
@@ -348,6 +356,13 @@ def build_feature_row(
     ref_date = pd.Timestamp(as_of_date)
 
     feat = {}
+    venue = venue_context or {}
+    feat["team_a_is_home"] = float(venue.get("team_a_is_home", 0.0))
+    feat["team_b_is_home"] = float(venue.get("team_b_is_home", 0.0))
+    feat["neutral_venue"] = float(venue.get("neutral_venue", 1.0))
+    feat["team_a_host_country"] = float(venue.get("team_a_host_country", 0.0))
+    feat["team_b_host_country"] = float(venue.get("team_b_host_country", 0.0))
+
     # Track which feature groups had source data — used for honest data_coverage
     active_groups = 0
     total_groups = 5  # h2h/form, tournament, rankings, goalscoring, supersub
@@ -384,10 +399,58 @@ def build_feature_row(
     # rank_diff is only meaningful when both ranks are known (non-zero sentinel)
     if feat["team_a_rank"] > 0 and feat["team_b_rank"] > 0:
         feat["rank_diff"] = feat["team_b_rank"] - feat["team_a_rank"]
+        feat["rank_abs_diff"] = abs(feat["rank_diff"])
+        feat["rank_closeness"] = 1.0 / (1.0 + (feat["rank_abs_diff"] / 25.0))
     else:
         feat["rank_diff"] = 0.0
+        feat["rank_abs_diff"] = 0.0
+        feat["rank_closeness"] = 0.0
     if rankings is not None:
         active_groups += 1
+
+    # Draw-tendency and team-similarity signals.
+    h2h_total = float(feat.get("h2h_total_meetings", 0.0))
+    h2h_draws = float(feat.get("h2h_draws", 0.0))
+    feat["h2h_draw_rate"] = h2h_draws / h2h_total if h2h_total > 0 else 0.0
+    feat["h2h_balance_score"] = 1.0 - min(abs(float(feat.get("h2h_weighted_win_ratio_a", 0.5)) - 0.5) * 2.0, 1.0)
+
+    team_a_form_total = max(
+        float(feat.get("team_a_form_wins", 0.0))
+        + float(feat.get("team_a_form_draws", 0.0))
+        + float(feat.get("team_a_form_losses", 0.0)),
+        1.0,
+    )
+    team_b_form_total = max(
+        float(feat.get("team_b_form_wins", 0.0))
+        + float(feat.get("team_b_form_draws", 0.0))
+        + float(feat.get("team_b_form_losses", 0.0)),
+        1.0,
+    )
+    team_a_draw_rate = float(feat.get("team_a_form_draws", 0.0)) / team_a_form_total
+    team_b_draw_rate = float(feat.get("team_b_form_draws", 0.0)) / team_b_form_total
+    feat["combined_form_draw_rate"] = (team_a_draw_rate + team_b_draw_rate) / 2.0
+    feat["form_draw_rate_diff"] = abs(team_a_draw_rate - team_b_draw_rate)
+
+    team_a_attack = float(feat.get("team_a_goals_scored_avg", 0.0))
+    team_b_attack = float(feat.get("team_b_goals_scored_avg", 0.0))
+    team_a_defense = float(feat.get("team_a_goals_conceded_avg", 0.0))
+    team_b_defense = float(feat.get("team_b_goals_conceded_avg", 0.0))
+    feat["attack_balance_abs_diff"] = abs(team_a_attack - team_b_attack)
+    feat["defense_balance_abs_diff"] = abs(team_a_defense - team_b_defense)
+    feat["combined_clean_sheet_rate"] = (
+        float(feat.get("team_a_clean_sheet_rate", 0.0)) + float(feat.get("team_b_clean_sheet_rate", 0.0))
+    ) / 2.0
+    avg_total_goal_tendency = (team_a_attack + team_a_defense + team_b_attack + team_b_defense) / 2.0
+    feat["low_scoring_tendency"] = max(0.0, min((2.5 - avg_total_goal_tendency) / 2.5, 1.0))
+    closeness_parts = [
+        float(feat.get("rank_closeness", 0.0)),
+        1.0 - min(feat["attack_balance_abs_diff"] / 3.0, 1.0),
+        1.0 - min(feat["defense_balance_abs_diff"] / 3.0, 1.0),
+        feat["h2h_balance_score"],
+        feat["combined_form_draw_rate"],
+        feat["low_scoring_tendency"],
+    ]
+    feat["draw_similarity_score"] = float(np.mean(closeness_parts))
 
     # Goalscoring
     if not skip_goalscoring:
@@ -426,6 +489,23 @@ def build_feature_row(
         or copa_data.get("players") is not None
         or copa_data.get("league") is not None
     ):
+        active_groups += 1
+
+    # International friendlies 2026 optional context.
+    friendly_features = build_friendlies_feature_values(team_a, team_b, as_of_date, friendlies_data)
+    feat.update(friendly_features)
+    if friendlies_data and (
+        friendlies_data.get("matches") is not None
+        or friendlies_data.get("teams") is not None
+        or friendlies_data.get("players") is not None
+        or friendlies_data.get("league") is not None
+    ):
+        active_groups += 1
+
+    # EURO 2024 player-strength snapshot.
+    euro_features = build_euro_feature_values(team_a, team_b, as_of_date, euro_data)
+    feat.update(euro_features)
+    if euro_data and euro_data.get("players") is not None:
         active_groups += 1
 
     # Player impact features
