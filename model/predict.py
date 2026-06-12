@@ -301,10 +301,13 @@ def predict_match(
     """
     model_bundle, feature_cols = _load_artifacts()
 
-    # Use today as reference so predictions use the most current rankings.
-    # The leakage guard (date < as_of_date) still works — all historical matches
-    # pre-date today, so nothing is excluded; we just get the newest rankings.
-    as_of_date = pd.Timestamp.now().normalize()
+    # Use tomorrow as the default reference so same-day completed matches from
+    # the live World Cup CSV are included even though the feed has dates only.
+    as_of_date = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
+    if matches_df is not None and "date" in matches_df.columns and not matches_df.empty:
+        latest_match_date = pd.to_datetime(matches_df["date"], errors="coerce").max()
+        if pd.notna(latest_match_date):
+            as_of_date = max(as_of_date, latest_match_date.normalize() + pd.Timedelta(days=1))
 
     TOTAL_GROUPS = 9
     feature_kwargs = {
@@ -364,8 +367,8 @@ def predict_match(
     )
     world_cup_context.update(
         {
-            "team_a_squad_edge_shift": float(world_cup_context.get("win_probability_shift", 0.0)),
-            "team_b_squad_edge_shift": -float(world_cup_context.get("win_probability_shift", 0.0)),
+            "team_a_squad_edge_shift": float(world_cup_context.get("squad_probability_shift", 0.0)),
+            "team_b_squad_edge_shift": -float(world_cup_context.get("squad_probability_shift", 0.0)),
             "draw_context_shift": float(world_cup_context.get("draw_probability_shift", 0.0)),
             "team_a_probability_shift": win_prob - base_probabilities["win_prob"],
             "draw_probability_shift": draw_prob - base_probabilities["draw_prob"],

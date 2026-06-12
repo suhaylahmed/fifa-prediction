@@ -11,7 +11,7 @@ import streamlit as st
 from data.copa_america import append_copa_matches, load_copa_america_data
 from data.euro_2024 import load_euro_2024_data
 from data.international_friendlies import append_friendlies_matches, load_friendlies_data
-from data.world_cup_2026 import load_world_cup_2026_data
+from data.world_cup_2026 import append_world_cup_2026_matches, load_world_cup_2026_data
 
 # CSVs are expected in the project root (one level up from data/)
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -69,8 +69,15 @@ def _add_tournament_flags(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
-def load_matches(include_copa: bool = True, include_friendlies: bool = True) -> pd.DataFrame | None:
+LIVE_DATA_CACHE_TTL_SECONDS = int(os.getenv("ML_PRJCT_LIVE_DATA_CACHE_TTL_SECONDS", "60"))
+
+
+@st.cache_data(show_spinner=False, ttl=LIVE_DATA_CACHE_TTL_SECONDS)
+def load_matches(
+    include_copa: bool = True,
+    include_friendlies: bool = True,
+    include_world_cup_2026: bool = True,
+) -> pd.DataFrame | None:
     candidates = [os.path.join(_ROOT, "matches.csv")]
     if USE_HISTORICAL_WEIGHTED:
         candidates.insert(0, os.path.join(_PROCESSED, "matches_all.csv"))
@@ -94,6 +101,8 @@ def load_matches(include_copa: bool = True, include_friendlies: bool = True) -> 
         df = append_copa_matches(df)
     if include_friendlies:
         df = append_friendlies_matches(df)
+    if include_world_cup_2026:
+        df = append_world_cup_2026_matches(df)
     df = _filter_date_window(df).sort_values("date").reset_index(drop=True)
     return _add_tournament_flags(df)
 
